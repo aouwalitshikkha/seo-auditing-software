@@ -2,7 +2,7 @@
 
 import csv
 from collections import defaultdict
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 from spider.parse import OG_TAGS, _is_data_uri
 from spider.status import classify
@@ -49,6 +49,29 @@ def is_geo_redirect(target_url: str, destination_url: str) -> bool:
 
 
 _DECORATIVE_PIXEL_HOSTS = {"stats.wp.com", "pixel.wp.com"}
+
+_SHARE_HOSTS = {
+    "facebook.com", "www.facebook.com",
+    "linkedin.com", "www.linkedin.com",
+    "pinterest.com", "www.pinterest.com",
+    "tumblr.com", "www.tumblr.com",
+    "twitter.com", "www.twitter.com", "x.com", "www.x.com",
+    "reddit.com", "www.reddit.com",
+    "wa.me", "api.whatsapp.com",
+}
+
+
+def _normalize_target(target: str) -> tuple[str, bool]:
+    """Return (normalized_url, was_share). For known social share hosts, strip the
+    query string so that share-button URLs differing only by the shared article URL
+    collapse to one row (e.g. all facebook.com/sharer.php?u=... become one)."""
+    host = _host(target)
+    for share_host in _SHARE_HOSTS:
+        if host == share_host or host.endswith("." + share_host):
+            p = urlparse(target)
+            normalized = urlunparse((p.scheme, p.netloc, p.path, None, None, None))
+            return normalized, True
+    return target, False
 
 
 def _is_decorative_image(src: str) -> bool:
@@ -187,11 +210,16 @@ def _collect(conn, origin):
                 seen.add(row)
                 internal.append(row)
         else:
+            normalized, was_share = _normalize_target(target)
             dest = final if verdict == "redirected" else ""
-            key = (str(code), target, dest)
+            key = (str(code), normalized, dest)
             if key not in ext:
-                note = "geo-redirect" if (verdict == "redirected"
-                                          and is_geo_redirect(target, final)) else ""
+                note_parts = []
+                if was_share:
+                    note_parts.append("share-button")
+                if verdict == "redirected" and is_geo_redirect(target, final):
+                    note_parts.append("geo-redirect")
+                note = "; ".join(note_parts)
                 ext[key] = {"pages": set(), "example": it["found_on_url"],
                             "note": note, "verdict": verdict}
                 ext_order.append(key)
@@ -261,7 +289,7 @@ def write_summary(conn, path: str, meta: dict) -> None:
     int_redir = sum(1 for r in internal if r[0] == "Redirected")
     ext_broken = sum(1 for k in ext_order if ext[k]["verdict"] == "broken")
     ext_redir = sum(1 for k in ext_order if ext[k]["verdict"] == "redirected")
-    ext_geo = sum(1 for k in ext_order if ext[k]["note"] == "geo-redirect")
+    ext_geo = sum(1 for k in ext_order if "geo-redirect" in ext[k]["note"])
     img_broken = sum(1 for k in img_order if k[0] == "Broken Image")
     img_alt = sum(1 for k in img_order if k[0] == "Missing Alt")
 

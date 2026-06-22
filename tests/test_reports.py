@@ -2,7 +2,7 @@ import csv
 from spider.store import (connect, init_schema, save_page, save_link,
                           save_image, save_status)
 from spider.reports import write_page_audit, write_link_issues, write_summary
-from spider.reports import is_internal, is_geo_redirect
+from spider.reports import is_internal, is_geo_redirect, _normalize_target
 
 
 def populated(tmp_path):
@@ -105,7 +105,7 @@ def test_summary_counts_three_sheets(tmp_path):
     # internal: 2 redirected (old on P1+P2) + 1 broken (gone) = 3 rows
     assert "Internal link issues:" in text
     assert "broken 1" in text and "redirected 2" in text
-    # external: pinterest(geo) + linkedin + semantica = 3 distinct; 1 broken, 2 redirects, 1 geo
+    # external: pinterest(geo+share-button) + linkedin(share-button) + semantica = 3 distinct
     assert "External problems:" in text
     assert "redirects 2" in text
     assert "geo 1" in text
@@ -155,9 +155,12 @@ def seeded(tmp_path):
     save_link(conn, "P-2", "https://e.com/p2", "https://www.pinterest.com/washparent")
     save_status(conn, "https://www.pinterest.com/washparent", 200, 1,
                 "https://za.pinterest.com/washparent")
-    # --- external non-geo redirect linkedin, found on P1 ---
-    save_link(conn, "P-1", "https://e.com/p1", "https://www.linkedin.com/shareArticle?x")
-    save_status(conn, "https://www.linkedin.com/shareArticle?x", 200, 1,
+    # --- external share-button (same endpoint, different query) found on P1 and P2 ---
+    save_link(conn, "P-1", "https://e.com/p1", "https://www.linkedin.com/shareArticle?url=https%3A%2F%2Fe.com%2Fp1")
+    save_link(conn, "P-2", "https://e.com/p2", "https://www.linkedin.com/shareArticle?url=https%3A%2F%2Fe.com%2Fp2")
+    save_status(conn, "https://www.linkedin.com/shareArticle?url=https%3A%2F%2Fe.com%2Fp1", 200, 1,
+                "https://www.linkedin.com/uas/login?x")
+    save_status(conn, "https://www.linkedin.com/shareArticle?url=https%3A%2F%2Fe.com%2Fp2", 200, 1,
                 "https://www.linkedin.com/uas/login?x")
     # --- external broken semantica (connect error), found on P1 and P2 ---
     save_link(conn, "P-1", "https://e.com/p1", "https://semantica.co.za")
@@ -216,10 +219,10 @@ def test_external_link_summary_sheet(tmp_path):
     assert pin["Destination URL"] == "https://za.pinterest.com/washparent"
     assert pin["Pages Affected"] == "2"
     assert pin["Example Page"] in {"https://e.com/p1", "https://e.com/p2"}
-    assert pin["Note"] == "geo-redirect"
-    li = by_target["https://www.linkedin.com/shareArticle?x"]
-    assert li["Pages Affected"] == "1"
-    assert li["Note"] == ""
+    assert pin["Note"] == "share-button; geo-redirect"
+    li = by_target["https://www.linkedin.com/shareArticle"]
+    assert li["Pages Affected"] == "2"   # collapsed by share-button normalization
+    assert li["Note"] == "share-button"
     assert li["Destination URL"] == "https://www.linkedin.com/uas/login?x"
     sem = by_target["https://semantica.co.za"]
     assert sem["Status Code"] == "ERR:ConnectError"
@@ -274,3 +277,47 @@ def test_image_issues_excludes_data_uri_and_decorative(tmp_path):
     assert not any("gravatar.com" in u for u in urls)
     assert "https://stats.wp.com/pixel.gif" not in urls
     assert len(rows) == 2
+
+
+def test_normalize_target_share_url():
+    """Share-button URLs differing only by query param collapse to same key."""
+    a, was_a = _normalize_target(
+        "https://www.facebook.com/sharer.php?u=https%3A%2F%2Fe.com%2Fa")
+    b, was_b = _normalize_target(
+        "https://www.facebook.com/sharer.php?u=https%3A%2F%2Fe.com%2Fb")
+    assert a == "https://www.facebook.com/sharer.php"
+    assert b == "https://www.facebook.com/sharer.php"
+    assert was_a is True
+    assert was_b is True
+
+
+def test_normalize_target_pinterest_share():
+    url = "https://pinterest.com/pin/create/button/?url=https%3A%2F%2Fe.com%2Fa&media=x&description=y"
+    normalized, was = _normalize_target(url)
+    assert normalized == "https://pinterest.com/pin/create/button/"
+    assert was is True
+
+
+def test_normalize_target_regular_url():
+    """Regular external URLs are not modified."""
+    url = "https://example.com/page?query=1"
+    normalized, was = _normalize_target(url)
+    assert normalized == url
+    assert was is False
+
+
+def test_normalize_target_linkedin_share():
+    a, was_a = _normalize_target(
+        "https://www.linkedin.com/shareArticle?mini=true&url=https%3A%2F%2Fe.com%2Fa")
+    b, was_b = _normalize_target(
+        "https://www.linkedin.com/shareArticle?mini=true&url=https%3A%2F%2Fe.com%2Fb")
+    assert a == "https://www.linkedin.com/shareArticle"
+    assert a == b
+    assert was_a is True
+
+
+def test_normalize_target_twitter_share():
+    normalized, was = _normalize_target(
+        "https://twitter.com/intent/tweet?text=Hello&url=https%3A%2F%2Fe.com%2Fa")
+    assert normalized == "https://twitter.com/intent/tweet"
+    assert was is True
